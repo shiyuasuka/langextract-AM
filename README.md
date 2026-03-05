@@ -2,7 +2,7 @@
 
 从高熵合金（HEA）领域学术 PDF 中抽取「成分–工艺–性能」结构化数据，输出 JSONL，供下游机器学习或知识库使用。
 
-基于 [LangExtract](https://github.com/google/langextract) ，适配星河社区的多种大模型（DeepSeek / ERNIE / Qwen / Kimi）及 Gemini，支持文本清洗、分块抽取、单块超时与解析失败重试，并在 Python 层做去噪过滤（仅保留本文研究材料）。
+基于 [LangExtract](https://github.com/google/langextract) ，默认按 **OpenAI 兼容接口** 工作：你可以在 `.env` 中自定义 `API Key / Base URL / Model / 请求参数`（如 `temperature`、`enable_thinking`）。同时保留 Gemini 入口，支持文本清洗、分块抽取、单块超时与解析失败重试，并在 Python 层做去噪过滤（仅保留本文研究材料）。
 
 ---
 
@@ -10,7 +10,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| **多模型** | ERNIE 4.5/5.0、DeepSeek V3、Qwen3 Coder、Kimi K2（星河 API）、Gemini 2.0 Flash |
+| **开放模型接入** | 支持任意 OpenAI 兼容 API（可直传 model_id）；Gemini 单独保留 |
 | **文本清洗** | 去除出版商声明；在正文后 30% 内截断致谢 / 利益冲突 / 参考文献，节省 Token |
 | **分块抽取** | 按字符数分块 + 重叠，单块失败可切半重试；单块超时（默认 240s）跳过，不拖死整程 |
 | **结构化输出** | 扁平 Extraction → 按 `material_id` 聚合为 MaterialEntity → 转目标 JSON 模板（`Composition_Info` / `Process_Info` / `Properties_Info`）写入 JSONL |
@@ -23,7 +23,8 @@
 ```
 AM/
 ├── main.py              # 入口：argparse、分块、lx.extract、聚合、写 JSONL（含 role 过滤）
-├── config_manager.py    # 模型工厂：星河 / Gemini 的 ModelConfig + max_tokens / timeout
+├── config_manager.py    # 模型工厂：环境变量驱动（OpenAI 兼容 + Gemini）
+├── openai_compatible_provider.py  # 本地 OpenAI provider 扩展（支持 extra_body 等）
 ├── pdf_utils.py         # PDF 提文本、clean_and_truncate_text、chunk_text
 ├── schemas.py           # Pydantic 模型（Element / Property / Processing / MaterialEntity）
 │                        # + build_prompt_description、group_extractions_to_entities、entity_to_target_json / material_entity_to_target_json
@@ -60,39 +61,85 @@ pip install -r requirements.txt
 在项目根目录创建 `.env` 文件：
 
 ```env
-# 星河社区（用于 ernie4.5/ ernie5 / deepseek / qwen / kimi）
-AI_STUDIO_API_KEY=你的星河API密钥
+# OpenAI 兼容接口（推荐；支持 python-dotenv 的 export 写法）
+export LLM_API_KEY="bce-v3/xxx"
+export LLM_BASE_URL="https://qianfan.bj.baidubce.com/v2"
+export LLM_MODEL="ep_3nr55ube9_ernie"
 
-# 仅在使用 --model gemini 时需要
-GOOGLE_API_KEY=你的Gemini密钥
+# 常用生成参数
+export LLM_TEMPERATURE="0.1"
+export LLM_MAX_OUTPUT_TOKENS="8192"
+
+# 显式关闭深度思考（会注入 extra_body.enable_thinking=false）
+export LLM_ENABLE_THINKING="false"
+
+# 思考预算（仅在 enable_thinking=true 时有意义，范围 100~60000）
+# export LLM_THINKING_BUDGET="800"
+
+# 额外请求体（可选；JSON 对象）
+# export LLM_EXTRA_BODY='{"enable_thinking": false, "foo": "bar"}'
+
+# 高级透传（可选；直接合并到 provider_kwargs）
+# export LLM_OPENAI_KWARGS='{"top_p":0.9,"response_format":{"type":"json_object"}}'
+
+# 部分 OpenAI 兼容网关不支持 response_format，可关闭强制 JSON 模式（可选）
+# export LLM_DISABLE_RESPONSE_FORMAT="true"
+
+# 调试原始输出（可选）
+# export LLM_DEBUG_RAW="true"
+
+# 单块超时秒数（可选，默认 240）
+# export CHUNK_TIMEOUT_SECONDS="300"
+
+# Gemini（仅在 --model gemini 时）
+# export GOOGLE_API_KEY="你的Gemini密钥"
 ```
 
-星河 API 密钥在 [飞桨 AI Studio](https://aistudio.baidu.com/) 获取；Gemini 在 Google AI Studio 获取。
+说明：
+- 默认 `python main.py` 会走 `--model env`，因此需要先配置 `LLM_MODEL`。
+- OpenAI 兼容模式下必须配置：`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。
+- 可通过 `LLM_EXTRA_BODY` 传任何网关私有字段；`LLM_ENABLE_THINKING=false` 会自动写入 `extra_body.enable_thinking=false`。
+- ERNIE 5.0 思考模型建议：`LLM_ENABLE_THINKING=true/false` + `LLM_THINKING_BUDGET`（100~60000）。
 
 ---
 
 ## 使用方法
 
 ```bash
-# 默认：ERNIE 4.5（参数名 `ernie4.5`），处理 AMpdf/ 下全部 PDF，chunk=6000，串行
+# 默认：env（读取 LLM_MODEL）
 python main.py
 
-# 指定模型
-python main.py --model qwen
-python main.py --model deepseek
-python main.py --model kimi
-python main.py --model ernie5
+# 使用 Gemini
 python main.py --model gemini
 
+# 显式走 env（读取 .env 的 LLM_MODEL）
+python main.py --model env
+
+# 或直接传任意 OpenAI 兼容 model_id
+python main.py --model ep_3nr55ube9_ernie
+
 # 限制篇数、分块大小、并发（当前默认串行，--workers 主要影响后续可扩展）
-python main.py --model ernie4 --max 2 --chunk 12000
+python main.py --model ep_3nr55ube9_ernie --max 2 --chunk 12000
+```
+
+### ERNIE 5.0 思考参数示例
+
+```env
+export LLM_MODEL="ernie-5.0-thinking-preview"
+
+# 关闭思考（推荐抽取任务）
+export LLM_ENABLE_THINKING="false"
+
+# 开启思考 + 限制思考 token
+# export LLM_ENABLE_THINKING="true"
+# export LLM_THINKING_BUDGET="800"
 ```
 
 ### 参数说明
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--model` | ernie4 | 模型：ernie5, ernie4, deepseek, qwen, kimi, gemini |
+| `--model` | `env` | 取值：`gemini` / `env` / 任意 OpenAI 兼容 `model_id` |
 | `--max` | 0 | 最多处理 PDF 数量，0 表示全部 |
 | `--chunk` | 6000 | 分块大小（字符），单块失败会切半重试 |
 | `--workers` | 1 | 分块并发数，1 为串行（便于排查卡住） |
@@ -144,4 +191,3 @@ python main.py --model ernie4 --max 2 --chunk 12000
 - `python-dotenv`：加载 `.env`
 
 ---
-
