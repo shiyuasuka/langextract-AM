@@ -3,12 +3,10 @@
 高熵合金论文抽取 Pipeline（基于 LangExtract）。
 
 用法：
-  python main.py                          # 默认 ernie4.5，处理全部 PDF
-  python main.py --model deepseek          # DeepSeek V3
-  python main.py --model qwen              # Qwen3 Coder 30B
-  python main.py --model kimi              # Kimi K2
-  python main.py --model ernie5            # ERNIE 5.0 Thinking
+  python main.py                          # 默认 env（读取 .env 的 LLM_MODEL）
   python main.py --model gemini            # Gemini 2.0 Flash
+  python main.py --model env               # 使用 .env 的 LLM_MODEL
+  python main.py --model ep_xxx_custom     # 直接传 OpenAI 兼容 model_id
   python main.py --max 2 --chunk 6000 --workers 5
 
 流程：
@@ -25,17 +23,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import langextract as lx
 from langextract.resolver import ResolverParsingError
 
-from config_manager import get_model_config
+from config_manager import get_model_config, get_default_model_selector
 from pdf_utils import (
     extract_text_from_pdf,
     list_pdfs,
@@ -64,8 +64,8 @@ AMPDF_DIR = ROOT / "AMpdf"
 OUTPUT_DIR = ROOT / "output"
 # 某块解析失败时，若块长大于此值则自动切半重试一次
 MIN_CHUNK_RETRY = 2000
-# 单块最大等待时间（秒），超时则跳过该块；ERNIE5 Thinking 很慢，建议 240+
-CHUNK_TIMEOUT = 240
+# 单块最大等待时间（秒），超时则跳过该块；可用 CHUNK_TIMEOUT_SECONDS 覆盖
+CHUNK_TIMEOUT = int(os.environ.get("CHUNK_TIMEOUT_SECONDS", "240"))
 # 分块级并发线程数（1=串行便于排查卡住，2+ 可能触发限流）
 DEFAULT_CHUNK_WORKERS = 1
 # 多线程写入同一 JSONL 时使用的锁
@@ -226,6 +226,26 @@ _REMOVE_PATTERNS = [
 ]
 
 
+def _norm_for_match(s: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _is_entity_grounded(entity, source_text: str) -> bool:
+  """
+  粗粒度防幻觉：实体名/化学式至少有一个能在原文中找到。
+  """
+  text_norm = _norm_for_match(source_text)
+  name_norm = _norm_for_match(getattr(entity, "material_name", ""))
+  formula_norm = _norm_for_match(getattr(entity, "formula", ""))
+
+  # 太短的标记（如 m1）噪声较大，不作为可靠锚点。
+  if len(name_norm) >= 4 and name_norm in text_norm:
+    return True
+  if len(formula_norm) >= 4 and formula_norm in text_norm:
+    return True
+  return False
+
+
 def clean_paper_text(text: str) -> str:
   """轻量清洗：仅移除出版商声明行，保留论文主体。"""
   lines = text.splitlines()
@@ -314,8 +334,14 @@ def _process_one_chunk(
     return (idx, [])
   except Exception as e:
     err_msg = str(e)
-    if "Connection" in err_msg or "Connection error" in err_msg or "disconnected" in err_msg.lower():
-      log.warning("Chunk %s 网络/连接错误，跳过: %s", label, err_msg[:80])
+    err_lower = err_msg.lower()
+    if (
+        "connection" in err_lower
+        or "disconnected" in err_lower
+        or "timed out" in err_lower
+        or "timeout" in err_lower
+    ):
+      log.warning("Chunk %s 网络/超时错误，跳过: %s", label, err_msg[:120])
       return (idx, [])
     log.exception("Chunk %s 未预期错误: %s", label, e)
     return (idx, [])
@@ -362,24 +388,48 @@ def process_one_pdf(
   )
 
   all_extractions = []
-  # 串行逐块跑 + 单块超时，避免某块在 200 OK 后解析卡死导致整程挂起
-  for idx, ch in enumerate(chunks, 1):
-    with ThreadPoolExecutor(max_workers=1) as executor:
+  worker_count = max(1, chunk_workers)
+
+  # workers=1: 串行 + 单块超时，便于排查卡死问题
+  if worker_count == 1:
+    for idx, ch in enumerate(chunks, 1):
+      executor = ThreadPoolExecutor(max_workers=1)
       future = executor.submit(
           _process_one_chunk, idx, ch, pdf_path.name, profile, prompt
       )
       try:
         _, ex = future.result(timeout=CHUNK_TIMEOUT)
         all_extractions.append((idx, ex))
-      except TimeoutError:
+      except FuturesTimeoutError:
         log.warning(
-            "Chunk %d 超过 %d 秒未返回（可能卡在 200 OK 后解析），跳过该块",
+            "Chunk %d 超过 %d 秒未返回（模型/网关响应过慢），跳过该块",
             idx, CHUNK_TIMEOUT,
         )
+        future.cancel()
         all_extractions.append((idx, []))
       except Exception as e:
         log.exception("Chunk %s 异常: %s", idx, e)
         all_extractions.append((idx, []))
+      finally:
+        # 超时后不等待该线程收尾，避免阻塞后续 chunk。
+        executor.shutdown(wait=False, cancel_futures=True)
+  else:
+    # workers>1: 真并发执行，提升吞吐；单块超时主要依赖底层 API timeout
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+      future_to_idx = {
+          executor.submit(
+              _process_one_chunk, idx, ch, pdf_path.name, profile, prompt
+          ): idx
+          for idx, ch in enumerate(chunks, 1)
+      }
+      for future in as_completed(future_to_idx):
+        idx = future_to_idx[future]
+        try:
+          _, ex = future.result()
+          all_extractions.append((idx, ex))
+        except Exception as e:
+          log.exception("Chunk %s 异常: %s", idx, e)
+          all_extractions.append((idx, []))
 
   # 按 chunk 顺序合并，保证结果可复现
   all_extractions.sort(key=lambda x: x[0])
@@ -400,8 +450,14 @@ def process_one_pdf(
 
   # ---- 4. 转目标 JSON 模板（仅保留本文材料 role==Target） ----
   log.info("[4/4] 转目标 JSON，过滤引用材料")
+  strict_grounding = os.environ.get(
+      "STRICT_ENTITY_GROUNDING", "true"
+  ).lower() in {"1", "true", "yes"}
   records = []
   for entity in entities:
+    if strict_grounding and not _is_entity_grounded(entity, text):
+      log.warning("        跳过疑似幻觉实体: %s / %s", entity.material_name, entity.formula)
+      continue
     rec = entity_to_target_json(
         entity=entity,
         source_pdf=pdf_path.name,
@@ -420,13 +476,16 @@ def process_one_pdf(
 # ============================================================
 
 def main():
+  default_model = get_default_model_selector()
   parser = argparse.ArgumentParser(
       description="高熵合金论文结构化抽取 Pipeline (LangExtract)",
   )
   parser.add_argument(
-      "--model", default="ernie4.5",
-      choices=["ernie5", "ernie4.5", "deepseek", "qwen", "kimi", "gemini"],
-      help="选择模型 (default: ernie4.5)",
+      "--model", default=default_model,
+      help=(
+          f"模型选择 (default: {default_model})。"
+          "支持: gemini / env / 任意 OpenAI 兼容 model_id"
+      ),
   )
   parser.add_argument(
       "--max", type=int, default=0, dest="max_pdfs",
