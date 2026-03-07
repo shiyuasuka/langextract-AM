@@ -62,8 +62,8 @@ AMPDF_DIR = ROOT / "AMpdf"
 OUTPUT_DIR = ROOT / "output"
 # 某块解析失败时，若块长大于此值则自动切半重试一次
 MIN_CHUNK_RETRY = 2000
-# 单块最大等待时间（秒），超时则跳过该块；可用 CHUNK_TIMEOUT_SECONDS 覆盖
-CHUNK_TIMEOUT = int(os.environ.get("CHUNK_TIMEOUT_SECONDS", "240"))
+# 单块最大等待时间（秒），超时则跳过该块；可用 CHUNK_TIMEOUT_SECONDS 覆盖（LLM 慢时可设 480～600）
+CHUNK_TIMEOUT = int(os.environ.get("CHUNK_TIMEOUT_SECONDS", "480"))
 # 分块级并发线程数（1=串行便于排查卡住，2+ 可能触发限流）
 DEFAULT_CHUNK_WORKERS = 1
 # 多线程写入同一 JSONL 时使用的锁
@@ -79,13 +79,14 @@ _write_lock = threading.Lock()
 # ============================================================
 
 EXAMPLES = [
-    # ---- 示例 1：DED 制备 RHEA，多温度力学性能 ----
+    # ---- 示例 1：DED 制备 RHEA，含 microstructure + key_params ----
     lx.data.ExampleData(
         text=(
             "The Ti42Hf21Nb21V16 refractory high-entropy alloy was fabricated "
             "using directed energy deposition with a laser power of 550 W and "
-            "a scanning speed of 5 mm/s. The alloy exhibited a yield strength "
-            "of 1030 MPa and total elongation of 22.5% at room temperature. "
+            "a scanning speed of 5 mm/s. The alloy has a single BCC phase with "
+            "equiaxed grains of ~200 um. It exhibited a yield strength "
+            "of 1030 MPa and fracture strain of 22.5% at room temperature. "
             "At 873 K, the yield strength was 636 MPa."
         ),
         extractions=[
@@ -97,6 +98,7 @@ EXAMPLES = [
                     "formula": "Ti42Hf21Nb21V16",
                     "elements_json": '{"Ti": 42, "Hf": 21, "Nb": 21, "V": 16}',
                     "unit": "at.%",
+                    "role": "Target",
                 },
             ),
             lx.data.Extraction(
@@ -110,6 +112,18 @@ EXAMPLES = [
                     "method": "DED",
                     "heat_treatment": "",
                     "details": "laser power 550 W, scanning speed 5 mm/s",
+                    "key_params_json": '{"Laser_Power_W": 550, "Scanning_Speed_mm_s": 5}',
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="microstructure",
+                extraction_text="single BCC phase with equiaxed grains of ~200 um",
+                attributes={
+                    "material_id": "T42",
+                    "main_phase": "BCC",
+                    "grain_size_um": "200",
+                    "has_precipitates": "false",
+                    "description": "Single BCC phase. Equiaxed grains ~200 um.",
                 },
             ),
             lx.data.Extraction(
@@ -125,10 +139,10 @@ EXAMPLES = [
             ),
             lx.data.Extraction(
                 extraction_class="property",
-                extraction_text="total elongation of 22.5%",
+                extraction_text="fracture strain of 22.5%",
                 attributes={
                     "material_id": "T42",
-                    "property_type": "Elongation_Total",
+                    "property_type": "Fracture_Strain",
                     "value": "22.5",
                     "unit": "%",
                     "test_temperature": "298 K",
@@ -148,59 +162,86 @@ EXAMPLES = [
         ],
     ),
 
-    # ---- 示例 2：电弧熔炼 HEA，含 balance 元素 ----
+    # ---- 示例 2：L-PBF 制备 HEA，含析出相 + UTS ----
     lx.data.ExampleData(
         text=(
-            "FeCoCrNiMo0.3 high entropy alloy was prepared by arc melting in "
-            "argon atmosphere, followed by homogenization at 1200C for 24h. "
-            "Tensile tests showed an ultimate tensile strength of 853 MPa and "
-            "elongation of 35.2% at 298 K."
+            "FeCoCrNiMo0.3 high entropy alloy was fabricated by laser powder "
+            "bed fusion with laser power 200 W, scanning speed 750 mm/s, "
+            "hatch spacing 80 um, layer thickness 40 um. The FCC matrix "
+            "contains rod-shaped sigma-phase precipitates. Tensile tests "
+            "showed a yield strength of 698 MPa, ultimate tensile strength "
+            "of 953 MPa, and total elongation of 27.78% at 298 K."
         ),
         extractions=[
             lx.data.Extraction(
                 extraction_class="composition",
                 extraction_text="FeCoCrNiMo0.3",
                 attributes={
-                    "material_id": "FeCoCrNiMo0.3",
+                    "material_id": "Mo3",
                     "formula": "FeCoCrNiMo0.3",
                     "elements_json": (
                         '{"Fe": 23.26, "Co": 23.26, "Cr": 23.26, '
                         '"Ni": 23.26, "Mo": 6.98}'
                     ),
                     "unit": "at.%",
+                    "role": "Target",
                 },
             ),
             lx.data.Extraction(
                 extraction_class="process",
                 extraction_text=(
-                    "arc melting in argon atmosphere, followed by "
-                    "homogenization at 1200C for 24h"
+                    "laser powder bed fusion with laser power 200 W, "
+                    "scanning speed 750 mm/s, hatch spacing 80 um, "
+                    "layer thickness 40 um"
                 ),
                 attributes={
-                    "material_id": "FeCoCrNiMo0.3",
-                    "method": "Arc Melting",
-                    "heat_treatment": "homogenization at 1200C for 24h",
-                    "details": "argon atmosphere",
+                    "material_id": "Mo3",
+                    "method": "L-PBF",
+                    "heat_treatment": "",
+                    "details": "laser power 200 W, scanning speed 750 mm/s, hatch spacing 80 um, layer thickness 40 um",
+                    "key_params_json": '{"Laser_Power_W": 200, "Scanning_Speed_mm_s": 750, "Hatch_Spacing_um": 80, "Layer_Thickness_um": 40}',
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="microstructure",
+                extraction_text="FCC matrix contains rod-shaped sigma-phase precipitates",
+                attributes={
+                    "material_id": "Mo3",
+                    "main_phase": "FCC",
+                    "grain_size_um": "",
+                    "has_precipitates": "true",
+                    "description": "FCC matrix with rod-shaped sigma-phase precipitates.",
                 },
             ),
             lx.data.Extraction(
                 extraction_class="property",
-                extraction_text="ultimate tensile strength of 853 MPa",
+                extraction_text="yield strength of 698 MPa",
                 attributes={
-                    "material_id": "FeCoCrNiMo0.3",
-                    "property_type": "UTS",
-                    "value": "853",
+                    "material_id": "Mo3",
+                    "property_type": "Yield_Strength",
+                    "value": "698",
                     "unit": "MPa",
                     "test_temperature": "298 K",
                 },
             ),
             lx.data.Extraction(
                 extraction_class="property",
-                extraction_text="elongation of 35.2%",
+                extraction_text="ultimate tensile strength of 953 MPa",
                 attributes={
-                    "material_id": "FeCoCrNiMo0.3",
-                    "property_type": "Elongation_Total",
-                    "value": "35.2",
+                    "material_id": "Mo3",
+                    "property_type": "Ultimate_Tensile_Strength",
+                    "value": "953",
+                    "unit": "MPa",
+                    "test_temperature": "298 K",
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="property",
+                extraction_text="total elongation of 27.78%",
+                attributes={
+                    "material_id": "Mo3",
+                    "property_type": "Total_Elongation",
+                    "value": "27.78",
                     "unit": "%",
                     "test_temperature": "298 K",
                 },
@@ -401,10 +442,10 @@ def process_one_pdf(
 
   prompt = build_prompt_description()
   chunks = chunk_text(text, chunk_size, overlap=500)
-  log.info(
-      "[2/4] lx.extract 分块并发 (共 %d 块, chunk=%d, workers=%d)",
-      len(chunks), chunk_size, chunk_workers,
-  )
+  n_chunks = len(chunks)
+  msg_llm_start = "  [LLM] 开始调用大模型进行材料抽取（共 %d 块），请勿中断…" % n_chunks
+  print(msg_llm_start, flush=True)
+  log.info("[2/4] lx.extract 分块并发 (共 %d 块, chunk=%d, workers=%d)", n_chunks, chunk_size, chunk_workers)
 
   all_extractions = []
   worker_count = max(1, chunk_workers)
@@ -419,6 +460,7 @@ def process_one_pdf(
       try:
         _, ex = future.result(timeout=CHUNK_TIMEOUT)
         all_extractions.append((idx, ex))
+        print("  [LLM] 已处理第 %d/%d 块" % (idx, n_chunks), flush=True)
       except FuturesTimeoutError:
         log.warning(
             "Chunk %d 超过 %d 秒未返回（模型/网关响应过慢），跳过该块",
@@ -441,6 +483,7 @@ def process_one_pdf(
           ): idx
           for idx, ch in enumerate(chunks, 1)
       }
+      done = 0
       for future in as_completed(future_to_idx):
         idx = future_to_idx[future]
         try:
@@ -449,6 +492,8 @@ def process_one_pdf(
         except Exception as e:
           log.exception("Chunk %s 异常: %s", idx, e)
           all_extractions.append((idx, []))
+        done += 1
+        print("  [LLM] 已处理第 %d/%d 块" % (done, n_chunks), flush=True)
 
   # 按 chunk 顺序合并，保证结果可复现
   all_extractions.sort(key=lambda x: x[0])
@@ -457,17 +502,21 @@ def process_one_pdf(
     merged.extend(ex)
   all_extractions = merged
 
+  msg_llm_done = "  [LLM] 大模型抽取完成，合计 %d 条" % len(all_extractions)
+  print(msg_llm_done, flush=True)
   log.info("        合计 %d 条 Extraction", len(all_extractions))
 
   if not all_extractions:
     return []
 
   # ---- 3. 聚合为 MaterialEntity (Pydantic) ----
+  print("  [LLM] 聚合 MaterialEntity…", flush=True)
   log.info("[3/4] 聚合 MaterialEntity")
   entities, evidence = group_extractions_to_entities(all_extractions)
   log.info("        识别出 %d 种材料", len(entities))
 
   # ---- 4. 转目标 JSON 模板（仅保留本文材料 role==Target） ----
+  print("  [LLM] 转目标 JSON，过滤引用材料…", flush=True)
   log.info("[4/4] 转目标 JSON，过滤引用材料")
   strict_grounding = os.environ.get(
       "STRICT_ENTITY_GROUNDING", "true"
@@ -548,7 +597,7 @@ def main():
   if args.preprocess_only:
     log.info("=== 仅预处理模式：PaddleOCR-VL → .txt ===")
     from ocr_preprocess import preprocess_all
-    results = preprocess_all(AMPDF_DIR, force=args.force_ocr)
+    results = preprocess_all(AMPDF_DIR, force=args.force_ocr, max_count=args.max_pdfs)
     log.info("预处理完成：生成 %d 个 .txt 文件", len(results))
     return 0
 

@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -154,6 +155,16 @@ def _ocr_pdf_via_images(pdf_path: Path, pipeline) -> str:
     return "\n\n".join(all_parts)
 
 
+def _ocr_progress_logger(stop_event: threading.Event) -> None:
+    """后台线程：每 60 秒打印一次，避免用户误以为程序卡死。用 print+flush 确保在 Paddle 大量 stderr 下仍可见。"""
+    count = 0
+    while not stop_event.wait(timeout=60):
+        count += 1
+        msg = "  … OCR 仍在处理中（已等待约 %d 分钟，大 PDF 首次可能较久）" % count
+        print(msg, flush=True)
+        log.info(msg)
+
+
 def ocr_pdf_to_text(pdf_path: Path) -> str:
     """
     将 PDF 解析为 Markdown 文本。
@@ -164,11 +175,29 @@ def ocr_pdf_to_text(pdf_path: Path) -> str:
       - 公式识别
       - 布局分析（PPStructureV3）
     """
+    # 先打提示再加载管线，否则会被 Paddle 大量加载日志淹没
+    msg_start = "  [OCR] 正在加载 PaddleOCR 管线并准备解析 PDF（首次会加载模型，请勿中断）…"
+    print(msg_start, flush=True)
+    log.info(msg_start)
     pipeline = _get_pipeline()
 
     try:
-        output = pipeline.predict(str(pdf_path))
-        pages_res = list(output)
+        msg_parse = "  [OCR] 开始解析 PDF（大文件可能需要数分钟），请勿中断…"
+        print(msg_parse, flush=True)
+        log.info(msg_parse)
+        stop_event = threading.Event()
+        progress_thread = threading.Thread(
+            target=_ocr_progress_logger, args=(stop_event,), daemon=True
+        )
+        progress_thread.start()
+        try:
+            output = pipeline.predict(str(pdf_path))
+            pages_res = list(output)
+        finally:
+            stop_event.set()
+        msg_done = "  [OCR] PaddleOCR 解析完成，共 %d 页" % len(pages_res)
+        print(msg_done, flush=True)
+        log.info(msg_done)
 
         if _pipeline_type == "VL" and len(pages_res) > 1:
             restructured = pipeline.restructure_pages(
@@ -270,14 +299,16 @@ def preprocess_all(
     pdf_dir: Path,
     output_dir: Path | None = None,
     force: bool = False,
+    max_count: int = 0,
 ) -> list[Path]:
     """
-    批量预处理：对目录下所有 PDF 执行 OCR + 章节裁剪。
+    批量预处理：对目录下 PDF 执行 OCR + 章节裁剪。
 
     Args:
         pdf_dir:    PDF 所在目录。
         output_dir: .txt 输出目录，默认与 PDF 同目录。
         force:      True 时强制重新 OCR（即使 .txt 已存在）。
+        max_count:   最多处理篇数，0 表示不限制（全部处理）。
 
     Returns:
         生成的 .txt 文件路径列表。
@@ -288,6 +319,9 @@ def preprocess_all(
     if not pdfs:
         log.warning("未在 %s 下找到 PDF", pdf_dir)
         return []
+    if max_count > 0:
+        pdfs = pdfs[:max_count]
+        log.info("仅预处理前 %d 篇 PDF", len(pdfs))
 
     results: list[Path] = []
     for i, pdf in enumerate(pdfs, 1):

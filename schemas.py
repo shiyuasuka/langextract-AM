@@ -120,6 +120,26 @@ class MaterialEntity(BaseModel):
       None,
       description="微观组织描述 (e.g., 晶粒、析出相)，对应 Microstructure_Text_For_AI；暂无则留空。",
   )
+  main_phase: Optional[str] = Field(
+      None,
+      description="主相 (e.g., 'BCC', 'FCC', 'FCC + L12').",
+  )
+  grain_size_um: Optional[float] = Field(
+      None,
+      description="平均晶粒尺寸 (μm)。",
+  )
+  has_precipitates: bool = Field(
+      False,
+      description="是否存在析出相。",
+  )
+  key_params_json: Optional[str] = Field(
+      None,
+      description="结构化工艺参数 JSON 字符串。",
+  )
+  process_category: str = Field(
+      default="Unknown",
+      description="标准化工艺分类 (AM_DED, AM_LPBF, Arc_Melting, …).",
+  )
   role: str = Field(
       default=MaterialRole.OTHER.value,
       description=(
@@ -152,46 +172,101 @@ def build_prompt_description() -> str:
   确保 Prompt 与 Schema 始终一致。
   """
   return """\
-Extract ALL materials, their compositions, processing methods, and mechanical \
-properties from this materials science text.
+You are a materials science data engineering expert specializing in \
+High-Entropy Alloys (HEA/MPEA) and Additive Manufacturing (AM). \
+Extract ALL materials, compositions, processing methods, microstructure, \
+and mechanical properties from this text into structured data.
 
-Extraction classes and required attributes:
+IMPORTANT: Search the ENTIRE text — abstract, body, tables, AND figure \
+captions — to capture every temperature point and every alloy variant.
+
+═══════════════════════════════════════════════════════════════════
+Extraction classes and required attributes
+═══════════════════════════════════════════════════════════════════
 
 1. "composition" — Chemical composition of each alloy.
    Attributes:
-     material_id       — short identifier for this alloy (e.g. T42, Mo3)
-     formula           — """ + MaterialEntity.model_fields["formula"].description + """
-     elements_json     — a JSON string mapping element symbols to numeric values,
+     material_id       — short identifier (e.g. T42, Mo3, SD3230, Mo-0)
+     formula           — normalized formula WITHOUT subscript symbols
+                         (e.g. Ti42Hf21Nb21V16, NOT Ti₄₂Hf₂₁).
+     elements_json     — JSON string mapping element symbols to at.% values,
                          e.g. '{"Ti": 42, "Hf": 21, "Nb": 21, "V": 16}'.
-                         """ + Element.model_fields["is_balance"].description + """
-                         If balance, set value to -1.
-     unit              — """ + Element.model_fields["unit"].description + """
-     role              — """ + MaterialEntity.model_fields["role"].description + """
-                         Must be exactly one of: Target, Reference, Other.
+                         If an element is 'balance'/'rem.', set value to -1.
+     unit              — 'at.%' or 'wt.%'
+     role              — 'Target' if the authors fabricated and studied this
+                         material; 'Reference' if only cited for comparison;
+                         'Other' if unclear. Must be exactly one of these.
 
 2. "process" — Fabrication / processing method.
    Attributes:
      material_id       — same id as the related composition
-     method            — """ + Processing.model_fields["method"].description + """
-     heat_treatment    — """ + (Processing.model_fields["heat_treatment"].description or "") + """
-     details           — other key parameters: power, speed, layer thickness, etc.
+     method            — standardized process category. Use these conventions:
+                         • Laser cladding / LENS / DED → AM_DED
+                         • SLM / LPBF / L-PBF → AM_LPBF
+                         • Arc Melting → Arc_Melting
+                         • Powder Metallurgy → PM
+                         If post-processing exists, append suffix:
+                         e.g. AM_LPBF_HeatTreated, AM_DED_Annealed
+     heat_treatment    — heat treatment conditions (e.g. '1150C 2h Air Cooled')
+     details           — other key process text (atmosphere, powder info, etc.)
+     key_params_json   — JSON string of ALL numeric fabrication parameters, e.g.
+                         '{"Laser_Power_W": 550, "Scanning_Speed_mm_s": 5,
+                           "Hatch_Spacing_um": 381, "Layer_Thickness_um": 200,
+                           "Preheating_Temp_C": 120}'.
+                         Extract every numeric parameter explicitly stated.
 
-3. "property" — Each individual mechanical property measurement.
+3. "microstructure" — Microstructure and phase information.
    Attributes:
      material_id       — same id as the related composition
-     property_type     — """ + Property.model_fields["property_type"].description + """
-     value             — """ + Property.model_fields["value"].description + """ (as a string)
-     unit              — """ + Property.model_fields["unit"].description + """
-     test_temperature  — """ + (Property.model_fields["test_temperature"].description or "") + """
+     main_phase        — primary crystal structure: 'BCC', 'FCC', 'FCC + L12',
+                         'HCP', etc. If multiple phases, join with ' + '.
+     grain_size_um     — average grain size in micrometers (numeric string).
+                         Leave empty if not explicitly stated.
+     has_precipitates  — 'true' if ANY precipitate / second phase is present
+                         (e.g. NbC, sigma, mu, Laves, L12), 'false' otherwise.
+                         If precipitates exist, also mention them in description.
+     description       — concise microstructure summary: grain morphology,
+                         texture, dislocation structures, precipitate type/size,
+                         chemical fluctuations, etc.
 
-Rules:
-- Use EXACT text spans from the source. Do NOT paraphrase.
+4. "property" — Each individual mechanical property measurement.
+   Attributes:
+     material_id       — same id as the related composition
+     property_type     — MUST be one of these standardized names:
+                         Yield_Strength, Ultimate_Tensile_Strength,
+                         Fracture_Strain, Elongation, Uniform_Elongation,
+                         Total_Elongation,
+                         Yield_Strength_Compressive, Ultimate_Strength_Compressive,
+                         Elongation_Compressive,
+                         Hardness, Hardness_HV, Hardness_HRC,
+                         Density, Elastic_Modulus.
+                         Do NOT use abbreviations (UTS → Ultimate_Tensile_Strength).
+     value             — numeric value as a string (e.g. '1030')
+     unit              — 'MPa', '%', 'HV', 'GPa', etc.
+     test_temperature  — ALWAYS in Kelvin with unit suffix.
+                         Room Temp / RT / 25°C → '298 K'
+                         600°C → '873 K'  (add 273)
+                         673 K stays '673 K'
+
+═══════════════════════════════════════════════════════════════════
+Strict Rules
+═══════════════════════════════════════════════════════════════════
+- Use EXACT text spans. Do NOT paraphrase or synthesize.
 - List extractions in order of appearance. Do NOT overlap spans.
-- Use the SAME material_id across composition / process / property.
+- Use the SAME material_id across all 4 extraction classes.
 - Only extract data EXPLICITLY stated. Do NOT guess or calculate.
-- If multiple materials are studied, extract ALL of them.
-- For range values (e.g. 20-30), take the midpoint.
+- If multiple alloys are studied (e.g. Mo0, Mo1, Mo3, Mo5),
+  extract ALL of them with separate material_ids.
+- ANISOTROPY: If the paper distinguishes Parallel/Z vs Perpendicular/X-Y
+  directions, create SEPARATE property extractions noting direction in
+  test_temperature (e.g. '298 K Horizontal', '298 K Vertical').
+- MULTI-CONDITION: If a material has As-Built AND Heat-Treated states,
+  create separate process extractions (method suffixed, e.g. AM_LPBF
+  vs AM_LPBF_HeatTreated) with corresponding separate properties.
+- For range values (20-30), use midpoint (25).
 - For 'balance' elements, set value to -1.
+- DEDUP: Do NOT extract the same (material, temperature, property_type,
+  value) combination twice. Each unique measurement appears once.
 """
 
 
@@ -252,7 +327,7 @@ def group_extractions_to_entities(
       mid = current_mid
 
     if mid not in groups:
-      groups[mid] = {"compositions": [], "processes": [], "properties": []}
+      groups[mid] = {"compositions": [], "processes": [], "properties": [], "microstructures": []}
 
     if cls == "composition":
       groups[mid]["compositions"].append(attrs)
@@ -260,6 +335,8 @@ def group_extractions_to_entities(
       groups[mid]["processes"].append(attrs)
     elif cls == "property":
       groups[mid]["properties"].append(attrs)
+    elif cls == "microstructure":
+      groups[mid]["microstructures"].append(attrs)
 
   entities: list[MaterialEntity] = []
   for mid, g in groups.items():
@@ -269,7 +346,9 @@ def group_extractions_to_entities(
     unit = "at.%"
     role_val = MaterialRole.OTHER.value
     for c in g["compositions"]:
-      formula = c.get("formula", formula)
+      raw_f = c.get("formula", "")
+      if raw_f:
+        formula = _normalize_formula(raw_f)
       unit = c.get("unit", unit)
       r = c.get("role", "").strip()
       if r in (MaterialRole.TARGET.value, MaterialRole.REFERENCE.value, MaterialRole.OTHER.value):
@@ -294,32 +373,85 @@ def group_extractions_to_entities(
         details_parts.append(det)
 
     details_joined = " ".join(details_parts).strip() if details_parts else None
+
+    key_params_merged: dict = {}
+    for p in g["processes"]:
+      kp_raw = p.get("key_params_json", "")
+      if kp_raw:
+        try:
+          kp_dict = json.loads(kp_raw) if isinstance(kp_raw, str) else kp_raw
+          if isinstance(kp_dict, dict):
+            key_params_merged.update(kp_dict)
+        except (json.JSONDecodeError, TypeError):
+          pass
+
     proc = Processing(
         method=method or "Unknown",
         heat_treatment=heat_treatment,
         details=details_joined,
     )
+    proc_category = _standardize_process_category(method, heat_treatment)
 
-    # --- properties ---
+    # --- microstructure ---
+    main_phase = ""
+    grain_size_um = None
+    has_precipitates = False
+    micro_descriptions: list[str] = []
+    for ms in g.get("microstructures", []):
+      phase = ms.get("main_phase", "").strip()
+      if phase:
+        main_phase = phase
+      gs = ms.get("grain_size_um", "")
+      if gs:
+        try:
+          grain_size_um = float(gs)
+        except (ValueError, TypeError):
+          pass
+      hp = ms.get("has_precipitates", "").strip().lower()
+      if hp in ("true", "yes", "1"):
+        has_precipitates = True
+      desc = ms.get("description", "").strip()
+      if desc:
+        micro_descriptions.append(desc)
+
+    microstructure_text = " ".join(micro_descriptions).strip() or None
+
+    # --- properties (with dedup and standardization) ---
     props: list[Property] = []
+    seen_props: set[tuple] = set()
     for pr in g["properties"]:
       try:
         val = float(pr.get("value", ""))
       except (ValueError, TypeError):
         continue
+      ptype = _standardize_property_type(
+          pr.get("property_type", pr.get("name", "Unknown"))
+      )
+      temp_str = pr.get("test_temperature", pr.get("condition"))
+      temp_k = _parse_temp_to_k(temp_str)
+      dedup_key = (ptype, val, pr.get("unit", ""), temp_k)
+      if dedup_key in seen_props:
+        continue
+      seen_props.add(dedup_key)
       props.append(Property(
-          property_type=pr.get("property_type", pr.get("name", "Unknown")),
+          property_type=ptype,
           value=val,
           unit=pr.get("unit", ""),
-          test_temperature=pr.get("test_temperature", pr.get("condition")),
+          test_temperature=temp_str,
       ))
 
     entity = MaterialEntity(
         material_name=mid,
-        formula=formula or mid,
+        formula=_normalize_formula(formula) if formula else mid,
         composition=elements,
         process=proc,
         properties=props,
+        microstructure=microstructure_text,
+        main_phase=main_phase or None,
+        grain_size_um=grain_size_um,
+        has_precipitates=has_precipitates,
+        key_params_json=json.dumps(key_params_merged, ensure_ascii=False) if key_params_merged else None,
+        process_category=proc_category,
         role=role_val,
     )
     entities.append(entity)
@@ -330,6 +462,91 @@ def group_extractions_to_entities(
 # ============================================================
 # 6. MaterialEntity → 用户目标 JSON 模板
 # ============================================================
+
+# ---- 工艺分类标准化 ----
+
+_PROCESS_CATEGORY_MAP: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:laser\s*cladding|LENS|DED|L-?DED|DMD|WAAM)", re.I), "AM_DED"),
+    (re.compile(r"(?:SLM|L-?PBF|LPBF|DMLS)", re.I),                   "AM_LPBF"),
+    (re.compile(r"(?:EBM|E-?PBF)", re.I),                              "AM_EBM"),
+    (re.compile(r"(?:arc\s*melting|VAM)", re.I),                        "Arc_Melting"),
+    (re.compile(r"(?:cast(?:ing)?|induction\s*melting)", re.I),         "Casting"),
+    (re.compile(r"(?:powder\s*metallurgy|HIP|SPS|MA)", re.I),          "PM"),
+    (re.compile(r"(?:cold\s*roll|hot\s*roll|rolling)", re.I),          "Rolling"),
+    (re.compile(r"(?:forging|forged)", re.I),                          "Forging"),
+]
+
+_HT_PATTERN = re.compile(
+    r"(?:anneal|heat.?treat|homogeni|solution|aging|temper|quench)", re.I
+)
+
+
+def _standardize_process_category(method: str, heat_treatment: str | None) -> str:
+    """将原始工艺描述映射为标准化 Process_Category。"""
+    combined = method
+    if heat_treatment:
+        combined = f"{method} {heat_treatment}"
+
+    base = "Unknown"
+    for pat, cat in _PROCESS_CATEGORY_MAP:
+        if pat.search(combined):
+            base = cat
+            break
+
+    if _HT_PATTERN.search(heat_treatment or ""):
+        return f"{base}_HeatTreated"
+    return base
+
+
+# ---- 化学式下标符号去除 ----
+
+_SUBSCRIPT_MAP = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+
+
+def _normalize_formula(raw: str) -> str:
+    """去除 Unicode 下标符号并清理空白，如 Ti₄₂Hf₂₁ → Ti42Hf21。"""
+    return raw.translate(_SUBSCRIPT_MAP).replace("$", "").strip()
+
+
+# ---- 性能类型标准化 ----
+
+_PROPERTY_TYPE_MAP = {
+    "uts": "Ultimate_Tensile_Strength",
+    "ultimate tensile strength": "Ultimate_Tensile_Strength",
+    "tensile strength": "Ultimate_Tensile_Strength",
+    "yield strength": "Yield_Strength",
+    "yield_strength": "Yield_Strength",
+    "compressive yield strength": "Yield_Strength_Compressive",
+    "yield_strength_compressive": "Yield_Strength_Compressive",
+    "compressive strength": "Ultimate_Strength_Compressive",
+    "ultimate_strength_compressive": "Ultimate_Strength_Compressive",
+    "ultimate compressive strength": "Ultimate_Strength_Compressive",
+    "elongation": "Elongation",
+    "elongation_total": "Total_Elongation",
+    "total elongation": "Total_Elongation",
+    "total_elongation": "Total_Elongation",
+    "uniform elongation": "Uniform_Elongation",
+    "uniform_elongation": "Uniform_Elongation",
+    "elongation_uniform": "Uniform_Elongation",
+    "fracture strain": "Fracture_Strain",
+    "fracture_strain": "Fracture_Strain",
+    "elongation_compressive": "Elongation_Compressive",
+    "compressive elongation": "Elongation_Compressive",
+    "compressive strain": "Elongation_Compressive",
+    "hardness": "Hardness",
+    "hardness_hv": "Hardness_HV",
+    "hardness_hrc": "Hardness_HRC",
+    "elastic modulus": "Elastic_Modulus",
+    "young's modulus": "Elastic_Modulus",
+    "density": "Density",
+}
+
+
+def _standardize_property_type(raw: str) -> str:
+    """将常见的 property_type 变体映射为标准名称。"""
+    key = raw.strip().lower()
+    return _PROPERTY_TYPE_MAP.get(key, raw.strip())
+
 
 def _parse_temp_to_k(temp_str: str | None) -> float:
   """温度字符串转开尔文: RT/room->298, 1000C->1273.15, 298K->298。"""
@@ -347,6 +564,22 @@ def _parse_temp_to_k(temp_str: str | None) -> float:
   return val + 273.15  # 默认按摄氏度
 
 
+def _extract_direction(temp_str: str | None) -> str | None:
+  """从温度字符串中提取方向信息（如 Horizontal / Vertical / Z / X-Y）。"""
+  if not temp_str:
+    return None
+  t = temp_str.lower()
+  for tag, label in [
+      ("horizontal", "Horizontal"), ("vertical", "Vertical"),
+      ("parallel", "Parallel_Z"), ("perpendicular", "Perpendicular_XY"),
+      (" z ", "Parallel_Z"), (" x-y", "Perpendicular_XY"),
+      (" xy", "Perpendicular_XY"),
+  ]:
+    if tag in t:
+      return label
+  return None
+
+
 def entity_to_target_json(
     entity: MaterialEntity,
     source_pdf: str,
@@ -359,7 +592,8 @@ def entity_to_target_json(
   """
   safe_name = re.sub(r"[^a-zA-Z0-9]", "", entity.material_name)[:15] or "Unknown"
   mat_id = f"M_{safe_name}"
-  sample_id = f"S_{safe_name}_AsBuilt"
+  ht_tag = "HT" if _HT_PATTERN.search(entity.process.heat_treatment or "") else "AB"
+  sample_id = f"S_{safe_name}_{ht_tag}"
 
   comp_dict = {
       e.symbol: (-1 if e.is_balance else e.value)
@@ -369,33 +603,48 @@ def entity_to_target_json(
   composition_info = {
       "Mat_ID": mat_id,
       "Alloy_Name_Raw": entity.material_name,
-      "Formula_Normalized": entity.formula,
+      "Formula_Normalized": _normalize_formula(entity.formula),
       "Composition_JSON": json.dumps(comp_dict, ensure_ascii=False),
       "Source_DOI": source_pdf,
   }
 
+  process_text_parts = []
+  if entity.process.method and entity.process.method != "Unknown":
+    process_text_parts.append(entity.process.method)
+  if entity.process.heat_treatment:
+    process_text_parts.append(entity.process.heat_treatment)
+  if entity.process.details:
+    process_text_parts.append(entity.process.details)
+  if entity.has_precipitates and entity.microstructure:
+    process_text_parts.append(f"Precipitates observed: {entity.microstructure}")
+  process_text = ". ".join(process_text_parts) if process_text_parts else ""
+
   process_info = {
       "Sample_ID": sample_id,
       "Mat_ID": mat_id,
-      "Process_Category": entity.process.method or "Unknown",
-      "Process_Text_For_AI": entity.process.details or entity.process.heat_treatment or entity.process.method or "",
-      "Key_Params_JSON": "{}",
-      "Main_Phase": "",
+      "Process_Category": entity.process_category,
+      "Process_Text_For_AI": process_text,
+      "Key_Params_JSON": entity.key_params_json or "{}",
+      "Main_Phase": entity.main_phase or "",
       "Microstructure_Text_For_AI": entity.microstructure or "",
-      "Has_Precipitates": False,
-      "Grain_Size_avg_um": None,
+      "Has_Precipitates": entity.has_precipitates,
+      "Grain_Size_avg_um": entity.grain_size_um,
   }
 
   props: list[dict[str, Any]] = []
   for i, p in enumerate(entity.properties, 1):
-    props.append({
+    direction = _extract_direction(p.test_temperature)
+    entry: dict[str, Any] = {
         "Test_ID": f"T_{safe_name}_{i:02d}",
         "Sample_ID": sample_id,
         "Test_Temperature_K": _parse_temp_to_k(p.test_temperature),
         "Property_Type": p.property_type,
         "Property_Value": p.value,
         "Property_Unit": p.unit,
-    })
+    }
+    if direction:
+      entry["Test_Direction"] = direction
+    props.append(entry)
 
   result: dict[str, Any] = {
       "_source_pdf": source_pdf,
